@@ -591,6 +591,81 @@ const SocialNetworkApp = () => {
     return pc;
   };
 
+  // Helper function để lấy media stream với error handling tốt hơn
+  const getMediaStream = async (constraints = { video: true, audio: true }) => {
+    // Kiểm tra xem getUserMedia có available không
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      // Fallback cho các trình duyệt cũ
+      const getUserMedia = navigator.getUserMedia || 
+                           navigator.webkitGetUserMedia || 
+                           navigator.mozGetUserMedia || 
+                           navigator.msGetUserMedia;
+      
+      if (!getUserMedia) {
+        throw new Error('getUserMedia không được hỗ trợ trên trình duyệt này. Vui lòng sử dụng HTTPS hoặc localhost.');
+      }
+      
+      // Sử dụng legacy API
+      return new Promise((resolve, reject) => {
+        getUserMedia.call(navigator, constraints, resolve, reject);
+      });
+    }
+
+    try {
+      // Kiểm tra permissions trước (chỉ trên các trình duyệt hỗ trợ)
+      if (navigator.permissions && navigator.permissions.query) {
+        try {
+          // Chrome/Edge
+          if (navigator.permissions.query.toString().includes('PermissionStatus')) {
+            const videoPermission = await navigator.permissions.query({ name: 'camera' }).catch(() => null);
+            const audioPermission = await navigator.permissions.query({ name: 'microphone' }).catch(() => null);
+            
+            if (videoPermission && videoPermission.state === 'denied') {
+              console.warn('Camera permission denied');
+            }
+            if (audioPermission && audioPermission.state === 'denied') {
+              console.warn('Microphone permission denied');
+            }
+          }
+        } catch (permErr) {
+          // Permissions API có thể không được hỗ trợ hoặc có lỗi, tiếp tục thử getUserMedia
+          console.log('Permissions API check failed, trying getUserMedia directly:', permErr);
+        }
+      }
+
+      console.log('Requesting media stream with constraints:', constraints);
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      console.log('Media stream obtained successfully:', {
+        videoTracks: stream.getVideoTracks().length,
+        audioTracks: stream.getAudioTracks().length,
+      });
+      return stream;
+    } catch (err) {
+      console.error('getUserMedia error details:', {
+        name: err.name,
+        message: err.message,
+        constraint: err.constraint,
+      });
+      
+      // Xử lý các lỗi cụ thể
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        throw new Error('PERMISSION_DENIED');
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        throw new Error('DEVICE_NOT_FOUND');
+      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+        throw new Error('DEVICE_IN_USE');
+      } else if (err.name === 'OverconstrainedError') {
+        throw new Error('CONSTRAINTS_NOT_SUPPORTED');
+      } else if (err.name === 'SecurityError') {
+        throw new Error('SECURITY_ERROR');
+      } else if (err.name === 'TypeError' && err.message.includes('Failed to execute')) {
+        throw new Error('PERMISSION_DENIED');
+      } else {
+        throw err;
+      }
+    }
+  };
+
   const startVideoCall = async (friend) => {
     if (!socketRef.current || !currentUser) {
       showToast('Chưa kết nối socket. Vui lòng thử lại.', 'error');
@@ -598,8 +673,8 @@ const SocialNetworkApp = () => {
     }
 
     try {
-      // Get local media stream
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      // Get local media stream với error handling tốt hơn
+      const stream = await getMediaStream({ video: true, audio: true });
       localStream.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
@@ -629,9 +704,33 @@ const SocialNetworkApp = () => {
       });
     } catch (err) {
       console.error('Error starting video call:', err);
-      showToast('Không thể truy cập camera/mic, kiểm tra quyền truy cập.', 'error');
+      
+      // Hiển thị thông báo lỗi cụ thể
+      let errorMessage = 'Không thể truy cập camera/mic.';
+      
+      if (err.message === 'PERMISSION_DENIED') {
+        errorMessage = 'Quyền truy cập camera/mic bị từ chối. Vui lòng cấp quyền trong cài đặt trình duyệt.';
+      } else if (err.message === 'DEVICE_NOT_FOUND') {
+        errorMessage = 'Không tìm thấy camera/microphone. Vui lòng kiểm tra thiết bị.';
+      } else if (err.message === 'DEVICE_IN_USE') {
+        errorMessage = 'Camera/microphone đang được sử dụng bởi ứng dụng khác.';
+      } else if (err.message === 'CONSTRAINTS_NOT_SUPPORTED') {
+        errorMessage = 'Trình duyệt không hỗ trợ yêu cầu camera/mic này.';
+      } else if (err.message === 'SECURITY_ERROR') {
+        errorMessage = 'Lỗi bảo mật. Vui lòng sử dụng HTTPS hoặc localhost.';
+      } else if (err.message.includes('getUserMedia không được hỗ trợ')) {
+        errorMessage = err.message;
+      }
+      
+      showToast(errorMessage, 'error');
       setIsCalling(false);
       setIsVideoCalling(false);
+      
+      // Cleanup nếu có stream đã được tạo
+      if (localStream.current) {
+        localStream.current.getTracks().forEach((t) => t.stop());
+        localStream.current = null;
+      }
     }
   };
 
@@ -643,8 +742,8 @@ const SocialNetworkApp = () => {
       const callerId = incomingCall.from;
       const signalData = incomingCall.signal;
 
-      // Get local media stream
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      // Get local media stream với error handling tốt hơn
+      const stream = await getMediaStream({ video: true, audio: true });
       localStream.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
@@ -690,7 +789,25 @@ const SocialNetworkApp = () => {
       });
     } catch (err) {
       console.error('Error accepting call:', err);
-      showToast('Không thể chấp nhận cuộc gọi.', 'error');
+      
+      // Hiển thị thông báo lỗi cụ thể
+      let errorMessage = 'Không thể chấp nhận cuộc gọi.';
+      
+      if (err.message === 'PERMISSION_DENIED') {
+        errorMessage = 'Quyền truy cập camera/mic bị từ chối. Vui lòng cấp quyền trong cài đặt trình duyệt.';
+      } else if (err.message === 'DEVICE_NOT_FOUND') {
+        errorMessage = 'Không tìm thấy camera/microphone. Vui lòng kiểm tra thiết bị.';
+      } else if (err.message === 'DEVICE_IN_USE') {
+        errorMessage = 'Camera/microphone đang được sử dụng bởi ứng dụng khác.';
+      } else if (err.message === 'CONSTRAINTS_NOT_SUPPORTED') {
+        errorMessage = 'Trình duyệt không hỗ trợ yêu cầu camera/mic này.';
+      } else if (err.message === 'SECURITY_ERROR') {
+        errorMessage = 'Lỗi bảo mật. Vui lòng sử dụng HTTPS hoặc localhost.';
+      } else if (err.message.includes('getUserMedia không được hỗ trợ')) {
+        errorMessage = err.message;
+      }
+      
+      showToast(errorMessage, 'error');
       setIncomingCall(null);
       endVideoCall();
     }
