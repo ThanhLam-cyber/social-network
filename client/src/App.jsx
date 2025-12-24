@@ -106,6 +106,8 @@ const SocialNetworkApp = () => {
   const friendRequestsPollRef = useRef(null);
   const previousFriendRequestIds = useRef(new Set());
   const toastTimeoutRef = useRef(null);
+  const iceCandidateQueue = useRef([]);
+  const callTargetId = useRef(null);
 
   // Toast notification function
   const showToast = (message, type = 'info') => {
@@ -533,7 +535,7 @@ const SocialNetworkApp = () => {
   };
 
   // WebRTC Configuration
-  const createPeerConnection = () => {
+  const createPeerConnection = (targetId) => {
     const configuration = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -562,11 +564,27 @@ const SocialNetworkApp = () => {
 
     // Handle ICE candidates
     pc.onicecandidate = (event) => {
-      if (event.candidate && socketRef.current) {
+      if (event.candidate && socketRef.current && targetId) {
         socketRef.current.emit('ice-candidate', {
-          to: callPartner?.id,
+          to: targetId,
           candidate: event.candidate,
         });
+      }
+    };
+
+    // Handle connection state changes
+    pc.onconnectionstatechange = () => {
+      console.log('Peer connection state:', pc.connectionState);
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        showToast('Kết nối video bị gián đoạn.', 'error');
+      }
+    };
+
+    // Handle ICE connection state
+    pc.oniceconnectionstatechange = () => {
+      console.log('ICE connection state:', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'failed') {
+        showToast('Không thể kết nối video. Vui lòng thử lại.', 'error');
       }
     };
 
@@ -590,12 +608,17 @@ const SocialNetworkApp = () => {
       setCallPartner(friend);
       setIsCalling(true);
       setIsVideoCalling(true);
+      callTargetId.current = friend.id;
+      iceCandidateQueue.current = [];
 
       // Create peer connection
-      peerConnection.current = createPeerConnection();
+      peerConnection.current = createPeerConnection(friend.id);
 
       // Create offer
-      const offer = await peerConnection.current.createOffer();
+      const offer = await peerConnection.current.createOffer({
+        offerToReceiveVideo: true,
+        offerToReceiveAudio: true,
+      });
       await peerConnection.current.setLocalDescription(offer);
 
       // Send call signal
@@ -616,6 +639,10 @@ const SocialNetworkApp = () => {
     if (!socketRef.current || !incomingCall || !currentUser) return;
 
     try {
+      // Lưu thông tin incoming call trước khi clear
+      const callerId = incomingCall.from;
+      const signalData = incomingCall.signal;
+
       // Get local media stream
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       localStream.current = stream;
@@ -624,29 +651,48 @@ const SocialNetworkApp = () => {
       }
 
       // Tìm thông tin friend từ friends list
-      const friend = friends.find((f) => f.id === incomingCall.from);
-      setCallPartner(friend || { id: incomingCall.from, name: 'Người gọi', avatar: '👤' });
+      const friend = friends.find((f) => f.id === callerId);
+      const callerInfo = friend || { id: callerId, name: 'Người gọi', avatar: '👤' };
+      setCallPartner(callerInfo);
       setIsVideoCalling(true);
       setIsCalling(false);
+      callTargetId.current = callerId;
+      iceCandidateQueue.current = [];
       setIncomingCall(null);
 
       // Create peer connection
-      peerConnection.current = createPeerConnection();
-      await peerConnection.current.setRemoteDescription(new RTCSessionDescription(incomingCall.signal));
+      peerConnection.current = createPeerConnection(callerId);
+      
+      // Set remote description
+      await peerConnection.current.setRemoteDescription(new RTCSessionDescription(signalData));
+
+      // Process queued ICE candidates
+      while (iceCandidateQueue.current.length > 0) {
+        const candidate = iceCandidateQueue.current.shift();
+        try {
+          await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error('Error adding queued ICE candidate:', err);
+        }
+      }
 
       // Create answer
-      const answer = await peerConnection.current.createAnswer();
+      const answer = await peerConnection.current.createAnswer({
+        offerToReceiveVideo: true,
+        offerToReceiveAudio: true,
+      });
       await peerConnection.current.setLocalDescription(answer);
 
       // Send acceptance signal
       socketRef.current.emit('accept-call', {
-        to: incomingCall.from,
+        to: callerId,
         signal: answer,
       });
     } catch (err) {
       console.error('Error accepting call:', err);
       showToast('Không thể chấp nhận cuộc gọi.', 'error');
       setIncomingCall(null);
+      endVideoCall();
     }
   };
 
@@ -666,6 +712,12 @@ const SocialNetworkApp = () => {
       localStream.current = null;
     }
 
+    // Stop remote stream
+    if (remoteStream.current) {
+      remoteStream.current.getTracks().forEach((t) => t.stop());
+      remoteStream.current = null;
+    }
+
     // Close peer connection
     if (peerConnection.current) {
       peerConnection.current.close();
@@ -677,17 +729,25 @@ const SocialNetworkApp = () => {
       remoteVideoRef.current.srcObject = null;
     }
 
+    // Clear local video
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = null;
+    }
+
     // Notify other party
-    if (socketRef.current && callPartner) {
+    if (socketRef.current && callTargetId.current) {
       socketRef.current.emit('end-call', {
-        to: callPartner.id,
+        to: callTargetId.current,
       });
     }
 
+    // Clear state
     setIsVideoCalling(false);
     setIsCalling(false);
     setCallPartner(null);
     setIncomingCall(null);
+    callTargetId.current = null;
+    iceCandidateQueue.current = [];
   };
 
   useEffect(() => {
@@ -730,8 +790,24 @@ const SocialNetworkApp = () => {
     // Xử lý call accepted
     socket.on('call-accepted', async (data) => {
       if (peerConnection.current) {
-        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(data.signal));
-        setIsCalling(false);
+        try {
+          await peerConnection.current.setRemoteDescription(new RTCSessionDescription(data.signal));
+          
+          // Process queued ICE candidates
+          while (iceCandidateQueue.current.length > 0) {
+            const candidate = iceCandidateQueue.current.shift();
+            try {
+              await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (err) {
+              console.error('Error adding queued ICE candidate:', err);
+            }
+          }
+          
+          setIsCalling(false);
+        } catch (err) {
+          console.error('Error setting remote description:', err);
+          showToast('Lỗi kết nối video.', 'error');
+        }
       }
     });
 
@@ -749,7 +825,21 @@ const SocialNetworkApp = () => {
     // Xử lý ICE candidate
     socket.on('ice-candidate', async (data) => {
       if (peerConnection.current && data.candidate) {
-        await peerConnection.current.addIceCandidate(new RTCIceCandidate(data.candidate));
+        try {
+          // Chỉ add ICE candidate nếu remote description đã được set
+          if (peerConnection.current.remoteDescription) {
+            await peerConnection.current.addIceCandidate(new RTCIceCandidate(data.candidate));
+          } else {
+            // Queue ICE candidate nếu remote description chưa được set
+            iceCandidateQueue.current.push(data.candidate);
+          }
+        } catch (err) {
+          console.error('Error adding ICE candidate:', err);
+          // Nếu lỗi, thử queue lại
+          if (!iceCandidateQueue.current.includes(data.candidate)) {
+            iceCandidateQueue.current.push(data.candidate);
+          }
+        }
       }
     });
 
