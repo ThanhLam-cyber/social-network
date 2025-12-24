@@ -9,12 +9,29 @@ require('dotenv').config();
 
 const app = express();
 
-// CORS / Socket allowed origin
-const allowedOrigin = process.env.FRONTEND_ORIGIN || '*';
+// CORS / Socket allowed origins
+const allowedOrigins = process.env.FRONTEND_ORIGIN 
+  ? process.env.FRONTEND_ORIGIN.split(',')
+  : [
+      'https://social-network-teal-eight.vercel.app',
+      'http://localhost:5173',
+      'http://localhost:3000',
+      'http://127.0.0.1:5173',
+      'http://127.0.0.1:3000'
+    ];
 
 // Middleware
 app.use(cors({
-  origin: allowedOrigin,
+  origin: (origin, callback) => {
+    // Cho phép requests không có origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
@@ -56,7 +73,7 @@ if (sslKey && sslCert && fs.existsSync(sslKey) && fs.existsSync(sslCert)) {
 // ✅ Khởi tạo Socket.IO SAU KHI đã có server instance
 const io = socketIO(server, {
   cors: {
-    origin: allowedOrigin,
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true

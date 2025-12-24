@@ -18,8 +18,8 @@ import {
 } from 'lucide-react';
 
 // Dùng biến môi trường để trỏ vào IP backend, tránh cố định localhost
-// Ví dụ: tạo client/.env với VITE_API_URL=http://192.168.1.9:3000/api
-const API_URL = import.meta.env.VITE_API_URL || `http://${window.location.hostname}:3000/api`;
+// Ví dụ: tạo client/.env với VITE_API_URL=https://social-network-gvil.onrender.com/api
+const API_URL = import.meta.env.VITE_API_URL || `https://social-network-gvil.onrender.com/api`;
 const SEARCH_DEBOUNCE = 350;
 
 const SocialNetworkApp = () => {
