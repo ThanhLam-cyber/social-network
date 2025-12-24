@@ -742,6 +742,15 @@ const SocialNetworkApp = () => {
       const callerId = incomingCall.from;
       const signalData = incomingCall.signal;
 
+      // Tìm thông tin friend từ friends list
+      const friend = friends.find((f) => f.id === callerId);
+      const callerInfo = friend || { id: callerId, name: 'Người gọi', avatar: '👤' };
+      
+      // Set state trước khi request media
+      setCallPartner(callerInfo);
+      callTargetId.current = callerId;
+      iceCandidateQueue.current = [];
+
       // Get local media stream với error handling tốt hơn
       const stream = await getMediaStream({ video: true, audio: true });
       localStream.current = stream;
@@ -749,31 +758,15 @@ const SocialNetworkApp = () => {
         localVideoRef.current.srcObject = stream;
       }
 
-      // Tìm thông tin friend từ friends list
-      const friend = friends.find((f) => f.id === callerId);
-      const callerInfo = friend || { id: callerId, name: 'Người gọi', avatar: '👤' };
-      setCallPartner(callerInfo);
       setIsVideoCalling(true);
       setIsCalling(false);
-      callTargetId.current = callerId;
-      iceCandidateQueue.current = [];
       setIncomingCall(null);
 
-      // Create peer connection
+      // Create peer connection AFTER getting media stream
       peerConnection.current = createPeerConnection(callerId);
       
       // Set remote description
       await peerConnection.current.setRemoteDescription(new RTCSessionDescription(signalData));
-
-      // Process queued ICE candidates
-      while (iceCandidateQueue.current.length > 0) {
-        const candidate = iceCandidateQueue.current.shift();
-        try {
-          await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.error('Error adding queued ICE candidate:', err);
-        }
-      }
 
       // Create answer
       const answer = await peerConnection.current.createAnswer({
@@ -787,6 +780,18 @@ const SocialNetworkApp = () => {
         to: callerId,
         signal: answer,
       });
+
+      // Process queued ICE candidates AFTER sending answer
+      setTimeout(async () => {
+        while (iceCandidateQueue.current.length > 0) {
+          const candidate = iceCandidateQueue.current.shift();
+          try {
+            await peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate));
+          } catch (err) {
+            console.error('Error adding queued ICE candidate:', err);
+          }
+        }
+      }, 100);
     } catch (err) {
       console.error('Error accepting call:', err);
       
