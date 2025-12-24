@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { io } from 'socket.io-client';
 import {
   Bell,
   Heart,
@@ -44,8 +45,16 @@ const getApiUrl = () => {
 
 const API_URL = getApiUrl();
 
+// Socket URL - lấy base URL từ API_URL (bỏ /api)
+const getSocketUrl = () => {
+  return API_URL.replace('/api', '');
+};
+
+const SOCKET_URL = getSocketUrl();
+
 // Debug: Log API URL để kiểm tra
 console.log('🔗 API_URL:', API_URL);
+console.log('🔗 SOCKET_URL:', SOCKET_URL);
 console.log('🔗 VITE_API_URL env:', import.meta.env.VITE_API_URL);
 console.log('🔗 Full login URL sẽ là:', `${API_URL}/auth/login`);
 
@@ -84,10 +93,30 @@ const SocialNetworkApp = () => {
 
   const [isVideoCalling, setIsVideoCalling] = useState(false);
   const [callPartner, setCallPartner] = useState(null);
+  const [incomingCall, setIncomingCall] = useState(null);
+  const [isCalling, setIsCalling] = useState(false);
+  const [toast, setToast] = useState(null);
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const localStream = useRef(null);
+  const remoteStream = useRef(null);
+  const peerConnection = useRef(null);
+  const socketRef = useRef(null);
   const messagesPollRef = useRef(null);
+  const friendRequestsPollRef = useRef(null);
+  const previousFriendRequestIds = useRef(new Set());
+  const toastTimeoutRef = useRef(null);
+
+  // Toast notification function
+  const showToast = (message, type = 'info') => {
+    if (toastTimeoutRef.current) {
+      clearTimeout(toastTimeoutRef.current);
+    }
+    setToast({ message, type, id: Date.now() });
+    toastTimeoutRef.current = setTimeout(() => {
+      setToast(null);
+    }, 3000);
+  };
 
   const authorizedFetch = async (path, options = {}) => {
     const res = await fetch(`${API_URL}${path}`, {
@@ -111,7 +140,8 @@ const SocialNetworkApp = () => {
     try {
       const user = await authorizedFetch('/users/me');
       setCurrentUser(user);
-      await Promise.all([loadPosts(), loadFriends(), loadFriendRequests(), loadConversations()]);
+      // Load lần đầu không hiển thị notification
+      await Promise.all([loadPosts(), loadFriends(), loadFriendRequests(false), loadConversations()]);
     } catch (err) {
       console.error(err);
       handleLogout();
@@ -225,8 +255,9 @@ const SocialNetworkApp = () => {
         ...prev,
       ]);
       setNewPost('');
+      showToast('Bài viết đã được đăng thành công!', 'success');
     } catch (err) {
-      alert('Tạo bài viết thất bại, thử lại sau.');
+      showToast('Tạo bài viết thất bại, thử lại sau.', 'error');
     }
   };
 
@@ -268,7 +299,7 @@ const SocialNetworkApp = () => {
     }
   };
 
-  const loadFriendRequests = async () => {
+  const loadFriendRequests = async (showNotification = true) => {
     if (!token) return;
     try {
       const data = await authorizedFetch('/friends/requests');
@@ -279,6 +310,35 @@ const SocialNetworkApp = () => {
         avatar: r.requester?.avatar || '👤',
         mutualFriends: 0,
       }));
+      
+      // Kiểm tra nếu có friend request mới
+      if (showNotification && previousFriendRequestIds.current.size > 0) {
+        const currentIds = new Set(mapped.map((r) => r.id));
+        const newRequests = mapped.filter(
+          (req) => !previousFriendRequestIds.current.has(req.id)
+        );
+        
+        if (newRequests.length > 0) {
+          // Hiển thị thông báo cho từng request mới
+          newRequests.forEach((req) => {
+            const message = `${req.name || req.username || 'Ai đó'} đã gửi lời mời kết bạn`;
+            // Sử dụng browser notification nếu được phép
+            if ('Notification' in window && Notification.permission === 'granted') {
+              new Notification('Lời mời kết bạn mới', {
+                body: message,
+                icon: '👤',
+                badge: '🔔',
+              });
+            } else {
+              // Fallback: hiển thị toast
+              showToast(message, 'info');
+            }
+          });
+        }
+      }
+      
+      // Cập nhật danh sách IDs
+      previousFriendRequestIds.current = new Set(mapped.map((r) => r.id));
       setFriendRequests(mapped);
     } catch (err) {
       console.error(err);
@@ -309,9 +369,9 @@ const SocialNetworkApp = () => {
         method: 'POST',
         body: JSON.stringify({ recipientId: userId }),
       });
-      alert('Đã gửi lời mời kết bạn');
+      showToast('Đã gửi lời mời kết bạn', 'success');
     } catch (err) {
-      alert('Gửi lời mời thất bại hoặc đã tồn tại');
+      showToast('Gửi lời mời thất bại hoặc đã tồn tại', 'error');
     }
   };
 
@@ -472,29 +532,162 @@ const SocialNetworkApp = () => {
     }
   };
 
+  // WebRTC Configuration
+  const createPeerConnection = () => {
+    const configuration = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ],
+    };
+
+    const pc = new RTCPeerConnection(configuration);
+
+    // Add local stream tracks to peer connection
+    if (localStream.current) {
+      localStream.current.getTracks().forEach((track) => {
+        pc.addTrack(track, localStream.current);
+      });
+    }
+
+    // Handle remote stream
+    pc.ontrack = (event) => {
+      const [stream] = event.streams;
+      remoteStream.current = stream;
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = stream;
+      }
+      setIsCalling(false); // Call connected
+    };
+
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+      if (event.candidate && socketRef.current) {
+        socketRef.current.emit('ice-candidate', {
+          to: callPartner?.id,
+          candidate: event.candidate,
+        });
+      }
+    };
+
+    return pc;
+  };
+
   const startVideoCall = async (friend) => {
+    if (!socketRef.current || !currentUser) {
+      showToast('Chưa kết nối socket. Vui lòng thử lại.', 'error');
+      return;
+    }
+
     try {
+      // Get local media stream
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       localStream.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
+
       setCallPartner(friend);
+      setIsCalling(true);
       setIsVideoCalling(true);
-      setTimeout(() => {
-        if (remoteVideoRef.current && localStream.current) {
-          remoteVideoRef.current.srcObject = localStream.current;
-        }
-      }, 1000);
+
+      // Create peer connection
+      peerConnection.current = createPeerConnection();
+
+      // Create offer
+      const offer = await peerConnection.current.createOffer();
+      await peerConnection.current.setLocalDescription(offer);
+
+      // Send call signal
+      socketRef.current.emit('call-user', {
+        to: friend.id,
+        from: currentUser.id || currentUser._id,
+        signal: offer,
+      });
     } catch (err) {
-      alert('Không thể truy cập camera/mic, kiểm tra quyền truy cập.');
+      console.error('Error starting video call:', err);
+      showToast('Không thể truy cập camera/mic, kiểm tra quyền truy cập.', 'error');
+      setIsCalling(false);
+      setIsVideoCalling(false);
     }
   };
 
+  const acceptCall = async () => {
+    if (!socketRef.current || !incomingCall || !currentUser) return;
+
+    try {
+      // Get local media stream
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStream.current = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+
+      // Tìm thông tin friend từ friends list
+      const friend = friends.find((f) => f.id === incomingCall.from);
+      setCallPartner(friend || { id: incomingCall.from, name: 'Người gọi', avatar: '👤' });
+      setIsVideoCalling(true);
+      setIsCalling(false);
+      setIncomingCall(null);
+
+      // Create peer connection
+      peerConnection.current = createPeerConnection();
+      await peerConnection.current.setRemoteDescription(new RTCSessionDescription(incomingCall.signal));
+
+      // Create answer
+      const answer = await peerConnection.current.createAnswer();
+      await peerConnection.current.setLocalDescription(answer);
+
+      // Send acceptance signal
+      socketRef.current.emit('accept-call', {
+        to: incomingCall.from,
+        signal: answer,
+      });
+    } catch (err) {
+      console.error('Error accepting call:', err);
+      showToast('Không thể chấp nhận cuộc gọi.', 'error');
+      setIncomingCall(null);
+    }
+  };
+
+  const rejectCall = () => {
+    if (socketRef.current && incomingCall) {
+      socketRef.current.emit('reject-call', {
+        to: incomingCall.from,
+      });
+    }
+    setIncomingCall(null);
+  };
+
   const endVideoCall = () => {
-    if (localStream.current) localStream.current.getTracks().forEach((t) => t.stop());
+    // Stop local stream
+    if (localStream.current) {
+      localStream.current.getTracks().forEach((t) => t.stop());
+      localStream.current = null;
+    }
+
+    // Close peer connection
+    if (peerConnection.current) {
+      peerConnection.current.close();
+      peerConnection.current = null;
+    }
+
+    // Clear remote video
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
+
+    // Notify other party
+    if (socketRef.current && callPartner) {
+      socketRef.current.emit('end-call', {
+        to: callPartner.id,
+      });
+    }
+
     setIsVideoCalling(false);
+    setIsCalling(false);
     setCallPartner(null);
+    setIncomingCall(null);
   };
 
   useEffect(() => {
@@ -504,9 +697,108 @@ const SocialNetworkApp = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
+  // Socket.io connection và WebRTC signaling
+  useEffect(() => {
+    if (!token || !currentUser) {
+      // Disconnect socket nếu logout
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+        socketRef.current = null;
+      }
+      return;
+    }
+
+    // Kết nối socket
+    const socket = io(SOCKET_URL, {
+      auth: {
+        token: token,
+      },
+      transports: ['websocket', 'polling'],
+    });
+
+    socketRef.current = socket;
+
+    // Thông báo user online
+    socket.emit('user-online', currentUser.id || currentUser._id);
+
+    // Xử lý incoming call
+    socket.on('incoming-call', async (data) => {
+      setIncomingCall(data);
+      // Có thể thêm sound notification ở đây
+    });
+
+    // Xử lý call accepted
+    socket.on('call-accepted', async (data) => {
+      if (peerConnection.current) {
+        await peerConnection.current.setRemoteDescription(new RTCSessionDescription(data.signal));
+        setIsCalling(false);
+      }
+    });
+
+    // Xử lý call rejected
+    socket.on('call-rejected', () => {
+      showToast('Người dùng đã từ chối cuộc gọi.', 'warning');
+      endVideoCall();
+    });
+
+    // Xử lý call ended
+    socket.on('call-ended', () => {
+      endVideoCall();
+    });
+
+    // Xử lý ICE candidate
+    socket.on('ice-candidate', async (data) => {
+      if (peerConnection.current && data.candidate) {
+        await peerConnection.current.addIceCandidate(new RTCIceCandidate(data.candidate));
+      }
+    });
+
+    // Cleanup
+    return () => {
+      if (socket) {
+        socket.disconnect();
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, currentUser]);
+
+  // Yêu cầu quyền thông báo khi component mount
+  useEffect(() => {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }, []);
+
+  // Poll friend requests định kỳ để phát hiện lời mời mới
+  useEffect(() => {
+    if (!token || !currentUser) {
+      if (friendRequestsPollRef.current) {
+        clearInterval(friendRequestsPollRef.current);
+        friendRequestsPollRef.current = null;
+      }
+      return;
+    }
+
+    // Load lần đầu (không hiển thị notification)
+    loadFriendRequests(false);
+    
+    // Poll mỗi 5 giây
+    friendRequestsPollRef.current = setInterval(() => {
+      loadFriendRequests(true);
+    }, 5000);
+
+    return () => {
+      if (friendRequestsPollRef.current) {
+        clearInterval(friendRequestsPollRef.current);
+        friendRequestsPollRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, currentUser]);
+
   const renderAuthForm = () => (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center px-4">
-      <div className="bg-white shadow-xl rounded-2xl p-8 w-full max-w-xl">
+      <div className="bg-white shadow-xl rounded-2xl p-8 w-full max-w-xl animate-fade-in">
         <h1 className="text-2xl font-bold text-blue-600 mb-2 text-center">SocialNet</h1>
         <p className="text-center text-gray-600 mb-6">
           {authMode === 'login' ? 'Đăng nhập để tiếp tục' : 'Tạo tài khoản để tham gia'}
@@ -549,9 +841,16 @@ const SocialNetworkApp = () => {
           <button
             onClick={handleAuth}
             disabled={authLoading}
-            className="bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-semibold flex justify-center items-center"
+            className="bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-semibold flex justify-center items-center disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"
           >
-            {authLoading ? 'Đang xử lý...' : authMode === 'login' ? 'Đăng nhập' : 'Đăng ký'}
+            {authLoading ? (
+              <span className="flex items-center">
+                <span className="animate-pulse-slow mr-2">⏳</span>
+                Đang xử lý...
+              </span>
+            ) : (
+              authMode === 'login' ? 'Đăng nhập' : 'Đăng ký'
+            )}
           </button>
 
           <button
@@ -590,16 +889,21 @@ const SocialNetworkApp = () => {
             <Smile size={20} className="text-yellow-500" />
             <span>Cảm xúc</span>
           </button>
-          <button onClick={handleCreatePost} className="bg-blue-500 text-white px-6 py-2 rounded-lg hover:bg-blue-600">
+          <button onClick={handleCreatePost} className="bg-blue-500 text-white px-6 py-2 rounded-lg hover:bg-blue-600 transition-all duration-200 font-semibold">
             Đăng
           </button>
         </div>
       </div>
 
-      {postsLoading && <div className="text-center text-gray-500">Đang tải bài viết...</div>}
+      {postsLoading && (
+        <div className="text-center text-gray-500 py-8">
+          <div className="inline-block animate-pulse-slow">⏳</div>
+          <p className="mt-2">Đang tải bài viết...</p>
+        </div>
+      )}
 
       {posts.map((post) => (
-        <div key={post.id} className="bg-white rounded-lg shadow">
+        <div key={post.id} className="bg-white rounded-lg shadow card-hover">
           <div className="p-4">
             <div className="flex items-center space-x-3 mb-3">
               <div className="text-3xl">{post.userAvatar}</div>
@@ -659,13 +963,13 @@ const SocialNetworkApp = () => {
                 <div className="flex space-x-2">
                   <button
                     onClick={() => acceptFriend(req.id)}
-                    className="bg-blue-500 text-white px-4 py-1 rounded hover:bg-blue-600"
+                    className="bg-blue-500 text-white px-4 py-1 rounded hover:bg-blue-600 transition-all duration-200 hover:scale-105 active:scale-95"
                   >
                     Chấp nhận
                   </button>
                   <button
                     onClick={() => rejectFriend(req.id)}
-                    className="bg-gray-200 text-gray-700 px-4 py-1 rounded hover:bg-gray-300"
+                    className="bg-gray-200 text-gray-700 px-4 py-1 rounded hover:bg-gray-300 transition-all duration-200 hover:scale-105 active:scale-95"
                   >
                     Xóa
                   </button>
@@ -679,8 +983,8 @@ const SocialNetworkApp = () => {
       <div className="bg-white rounded-lg shadow p-4">
         <h3 className="font-semibold text-lg mb-4">Bạn bè ({friends.length})</h3>
         <div className="grid grid-cols-2 gap-4">
-          {friends.map((f) => (
-            <div key={f.id} className="border rounded-lg p-3">
+            {friends.map((f) => (
+            <div key={f.id} className="border rounded-lg p-3 card-hover">
               <div className="flex items-center space-x-3 mb-3">
                 <div className="relative">
                   <div className="text-3xl">{f.avatar}</div>
@@ -700,14 +1004,14 @@ const SocialNetworkApp = () => {
                       openChatWithUser(f.id);
                     }
                   }}
-                  className="flex-1 bg-gray-200 text-gray-700 px-3 py-1 rounded text-sm hover:bg-gray-300"
+                  className="flex-1 bg-gray-200 text-gray-700 px-3 py-1 rounded text-sm hover:bg-gray-300 transition-all duration-200 hover:scale-105 active:scale-95"
                 >
                   <MessageCircle size={16} className="inline mr-1" />
                   Nhắn tin
                 </button>
                 <button
                   onClick={() => startVideoCall(f)}
-                  className="flex-1 bg-blue-500 text-white px-3 py-1 rounded text-sm hover:bg-blue-600"
+                  className="flex-1 bg-blue-500 text-white px-3 py-1 rounded text-sm hover:bg-blue-600 transition-all duration-200 hover:scale-105 active:scale-95"
                 >
                   <Video size={16} className="inline mr-1" />
                   Gọi
@@ -770,12 +1074,12 @@ const SocialNetworkApp = () => {
                 </div>
               </div>
               <div className="flex space-x-2">
-                <button className="p-2 hover:bg-gray-100 rounded-full">
+                <button className="p-2 hover:bg-gray-100 rounded-full transition-all duration-200 hover:scale-110 active:scale-95">
                   <Phone size={20} className="text-blue-500" />
                 </button>
                 <button
                   onClick={() => startVideoCall(friends.find((f) => f.id === activeChat.friendId))}
-                  className="p-2 hover:bg-gray-100 rounded-full"
+                  className="p-2 hover:bg-gray-100 rounded-full transition-all duration-200 hover:scale-110 active:scale-95"
                 >
                   <Video size={20} className="text-blue-500" />
                 </button>
@@ -813,7 +1117,7 @@ const SocialNetworkApp = () => {
                 placeholder="Nhập tin nhắn..."
                 className="flex-1 bg-gray-100 rounded-full px-4 py-2 outline-none"
               />
-              <button onClick={handleSendMessage} className="bg-blue-500 text-white p-2 rounded-full hover:bg-blue-600">
+              <button onClick={handleSendMessage} className="bg-blue-500 text-white p-2 rounded-full hover:bg-blue-600 transition-all duration-200 hover:scale-110 active:scale-95">
                 <Send size={20} />
               </button>
             </div>
@@ -956,8 +1260,37 @@ const SocialNetworkApp = () => {
         {activeTab === 'messages' && renderMessages()}
       </main>
 
+      {/* Incoming Call Modal */}
+      {incomingCall && !isVideoCalling && (() => {
+        const caller = friends.find((f) => f.id === incomingCall.from);
+        return (
+          <div className="fixed inset-0 bg-black bg-opacity-80 z-50 flex items-center justify-center animate-fade-in">
+            <div className="bg-white rounded-2xl p-8 max-w-md w-full mx-4 text-center animate-fade-in shadow-2xl">
+              <div className="text-6xl mb-4 animate-bounce-slow">{caller?.avatar || '👤'}</div>
+              <h2 className="text-2xl font-bold mb-2">Cuộc gọi đến</h2>
+              <p className="text-gray-600 mb-6">{caller?.name || caller?.username || 'Ai đó'} đang gọi cho bạn</p>
+              <div className="flex justify-center space-x-4">
+                <button
+                  onClick={rejectCall}
+                  className="bg-red-500 text-white p-4 rounded-full hover:bg-red-600 transition-all duration-200 hover:scale-110 active:scale-95"
+                >
+                  <PhoneOff size={24} />
+                </button>
+                <button
+                  onClick={acceptCall}
+                  className="bg-green-500 text-white p-4 rounded-full hover:bg-green-600 transition-all duration-200 hover:scale-110 active:scale-95"
+                >
+                  <Phone size={24} />
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Video Call UI */}
       {isVideoCalling && (
-        <div className="fixed inset-0 bg-black bg-opacity-90 z-50 flex items-center justify-center">
+        <div className="fixed inset-0 bg-black bg-opacity-90 z-50 flex items-center justify-center animate-fade-in">
           <div className="relative w-full h-full">
             <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover" />
             <div className="absolute top-4 right-4 w-48 h-36 bg-gray-800 rounded-lg overflow-hidden shadow-lg">
@@ -965,24 +1298,60 @@ const SocialNetworkApp = () => {
             </div>
             <div className="absolute top-4 left-4 text-white">
               <div className="flex items-center space-x-3 bg-black bg-opacity-50 px-4 py-2 rounded-lg">
-                <div className="text-2xl">{callPartner?.avatar}</div>
+                <div className="text-2xl">{callPartner?.avatar || '👤'}</div>
                 <div>
-                  <div className="font-semibold">{callPartner?.name}</div>
-                  <div className="text-sm text-gray-300">Đang gọi...</div>
+                  <div className="font-semibold">{callPartner?.name || 'Đang kết nối...'}</div>
+                  <div className="text-sm text-gray-300">
+                    {isCalling ? 'Đang gọi...' : 'Đã kết nối'}
+                  </div>
                 </div>
               </div>
             </div>
             <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 flex items-center space-x-4">
-              <button className="bg-gray-700 text-white p-4 rounded-full hover:bg-gray-600">
+              <button className="bg-gray-700 text-white p-4 rounded-full hover:bg-gray-600 transition-all duration-200 hover:scale-110 active:scale-95">
                 <Video size={24} />
               </button>
-              <button className="bg-gray-700 text-white p-4 rounded-full hover:bg-gray-600">
+              <button className="bg-gray-700 text-white p-4 rounded-full hover:bg-gray-600 transition-all duration-200 hover:scale-110 active:scale-95">
                 <Phone size={24} />
               </button>
-              <button onClick={endVideoCall} className="bg-red-500 text-white p-4 rounded-full hover:bg-red-600">
+              <button onClick={endVideoCall} className="bg-red-500 text-white p-4 rounded-full hover:bg-red-600 transition-all duration-200 hover:scale-110 active:scale-95">
                 <PhoneOff size={24} />
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Notification */}
+      {toast && (
+        <div
+          className={`fixed top-4 right-4 z-50 min-w-[300px] max-w-md px-4 py-3 rounded-lg shadow-2xl transform transition-all duration-300 ease-in-out ${
+            toast.type === 'success'
+              ? 'bg-green-500 text-white'
+              : toast.type === 'error'
+              ? 'bg-red-500 text-white'
+              : toast.type === 'warning'
+              ? 'bg-yellow-500 text-white'
+              : 'bg-blue-500 text-white'
+          } animate-slide-in-right`}
+          style={{
+            animation: 'slideInRight 0.3s ease-out',
+          }}
+        >
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              {toast.type === 'success' && <span>✅</span>}
+              {toast.type === 'error' && <span>❌</span>}
+              {toast.type === 'warning' && <span>⚠️</span>}
+              {toast.type === 'info' && <span>ℹ️</span>}
+              <p className="font-medium">{toast.message}</p>
+            </div>
+            <button
+              onClick={() => setToast(null)}
+              className="ml-4 text-white hover:text-gray-200 transition-colors"
+            >
+              ✕
+            </button>
           </div>
         </div>
       )}

@@ -39,4 +39,15 @@ module.exports = (io, socket, onlineUsers) => {
       io.to(recipientSocketId).emit('call-ended');
     }
   });
+
+  socket.on('ice-candidate', (data) => {
+    const { to, candidate } = data;
+    const recipientSocketId = onlineUsers.get(to);
+    
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('ice-candidate', {
+        candidate
+      });
+    }
+  });
 };
