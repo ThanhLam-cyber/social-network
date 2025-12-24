@@ -17,9 +17,38 @@ import {
   Video,
 } from 'lucide-react';
 
-// Dùng biến môi trường để trỏ vào IP backend, tránh cố định localhost
-// Ví dụ: tạo client/.env với VITE_API_URL=https://social-network-gvil.onrender.com/api
-const API_URL = import.meta.env.VITE_API_URL || `https://social-network-gvil.onrender.com/api`;
+// API URL - ưu tiên biến môi trường, fallback về Render.com
+const getApiUrl = () => {
+  const envUrl = import.meta.env.VITE_API_URL;
+  let baseUrl;
+  
+  // Kiểm tra nếu envUrl là undefined, null, hoặc string rỗng
+  if (!envUrl || typeof envUrl !== 'string' || envUrl.trim() === '') {
+    baseUrl = 'https://social-network-gvil.onrender.com';
+  } else if (envUrl.includes('VITE_API_URL=')) {
+    // Kiểm tra nếu envUrl có chứa "VITE_API_URL=" (format sai)
+    console.warn('⚠️ VITE_API_URL có format sai, sử dụng URL mặc định');
+    baseUrl = 'https://social-network-gvil.onrender.com';
+  } else {
+    // Loại bỏ khoảng trắng và đảm bảo không có dấu / ở cuối
+    baseUrl = envUrl.trim().replace(/\/$/, '');
+  }
+  
+  // Đảm bảo luôn có /api ở cuối
+  if (!baseUrl.endsWith('/api')) {
+    baseUrl = baseUrl.endsWith('/') ? `${baseUrl}api` : `${baseUrl}/api`;
+  }
+  
+  return baseUrl;
+};
+
+const API_URL = getApiUrl();
+
+// Debug: Log API URL để kiểm tra
+console.log('🔗 API_URL:', API_URL);
+console.log('🔗 VITE_API_URL env:', import.meta.env.VITE_API_URL);
+console.log('🔗 Full login URL sẽ là:', `${API_URL}/auth/login`);
+
 const SEARCH_DEBOUNCE = 350;
 
 const SocialNetworkApp = () => {
@@ -132,7 +161,9 @@ const SocialNetworkApp = () => {
           };
 
       const endpoint = authMode === 'register' ? '/auth/register' : '/auth/login';
-      const res = await fetch(`${API_URL}${endpoint}`, {
+      const fullUrl = `${API_URL}${endpoint}`;
+      console.log('📤 POST request to:', fullUrl);
+      const res = await fetch(fullUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
